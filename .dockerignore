@@ -1,0 +1,21 @@
+# ===== Не нужно в Docker образе =====
+node_modules/
+.next/
+.git/
+.github/
+docs/
+__tests__/
+coverage/
+*.md
+.gitignore
+.eslintrc*
+eslint.config*
+vitest.config*
+tsconfig.json
+docker-compose*.yml
+nginx/
+traffic-gen/
+.deploy/
+data/
+.vscode/
+.idea/

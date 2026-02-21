@@ -1,0 +1,245 @@
+# ============================================================
+# Deploy Local Workflow — CD на локальный ПК через self-hosted runner
+# ============================================================
+#
+# Запускается:
+#   - Вручную (workflow_dispatch) — кнопка "Run workflow" в GitHub UI
+#   - При push в main (после publish) — автоматический деплой
+#
+# Требования:
+#   - Self-hosted runner запущен на вашем ПК (см. docs/runner-setup-windows.md)
+#   - Docker Desktop запущен
+#   - Порт 8080 свободен
+#
+# Что делает:
+#   1) Checkout репо (для docker-compose.yml и nginx.conf)
+#   2) Login в GHCR
+#   3) Pull свежий image
+#   4) docker compose up -d
+#   5) Healthcheck http://localhost:8080/healthz
+#   6) Если healthcheck fail → rollback на предыдущий хороший тег
+
+name: Deploy Local
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to deploy (default: latest)"
+        required: false
+        default: "latest"
+  push:
+    branches: [main]
+
+# Один деплой за раз (не параллельно)
+concurrency:
+  group: deploy-local
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    name: "Deploy to Local Machine"
+    # Ваш self-hosted runner должен иметь ВСЕ эти labels.
+    # self-hosted — автоматический label.
+    # Windows — автоматический (определяется по ОС).
+    # local-deploy — кастомный (добавляете при регистрации runner).
+    runs-on: [self-hosted, Windows, local-deploy]
+
+    steps:
+      # ─── Шаг 1: Checkout ────────────────────────────────────
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+        # Нужен для: docker-compose.yml, nginx/nginx.conf
+
+      # ─── Шаг 2: Определяем тег для деплоя ──────────────────
+      - name: "🏷️ Determine deploy tag"
+        id: tag
+        shell: pwsh
+        run: |
+          # Если запуск ручной (workflow_dispatch) — используем введённый тег.
+          # Если push в main — используем latest.
+          $inputTag = "${{ github.event.inputs.tag }}"
+          if ($inputTag -and $inputTag -ne "") {
+            $tag = $inputTag
+          } else {
+            $tag = "latest"
+          }
+          Write-Host "📌 Deploy tag: $tag"
+          echo "DEPLOY_TAG=$tag" >> $env:GITHUB_OUTPUT
+
+      # ─── Шаг 3: Login в GHCR ───────────────────────────────
+      - name: "🔑 Login to GHCR"
+        shell: pwsh
+        run: |
+          Write-Host "🔑 Logging in to ghcr.io..."
+          # Для PUBLIC repo: GITHUB_TOKEN работает.
+          # Для PRIVATE repo: может потребоваться PAT (см. docs/runner-setup-windows.md).
+          # Секрет GHCR_PAT берём если он задан, иначе GITHUB_TOKEN.
+          $token = "${{ secrets.GHCR_PAT }}"
+          if (-not $token) {
+            $token = "${{ secrets.GITHUB_TOKEN }}"
+            Write-Host "  ℹ️  Используем GITHUB_TOKEN (public repo)"
+          } else {
+            Write-Host "  ℹ️  Используем GHCR_PAT (private repo)"
+          }
+          $token | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "❌ Docker login failed!"
+            exit 1
+          }
+          Write-Host "✅ Login successful"
+
+      # ─── Шаг 4: Сохраняем текущий тег (для rollback) ───────
+      - name: "💾 Save current tag for rollback"
+        shell: pwsh
+        run: |
+          $deployDir = ".deploy"
+          $tagFile = Join-Path $deployDir "last_good_tag.txt"
+
+          if (-not (Test-Path $deployDir)) {
+            New-Item -ItemType Directory -Path $deployDir -Force | Out-Null
+          }
+
+          if (Test-Path $tagFile) {
+            $previousTag = Get-Content $tagFile -Raw
+            Write-Host "📋 Previous good tag: $($previousTag.Trim())"
+          } else {
+            Write-Host "📋 No previous tag found (first deploy)"
+          }
+
+      # ─── Шаг 5: Pull и запуск ──────────────────────────────
+      - name: "🚀 Pull image and start services"
+        shell: pwsh
+        env:
+          TICKETDESK_IMAGE: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.DEPLOY_TAG }}"
+        run: |
+          Write-Host "═══════════════════════════════════════════"
+          Write-Host "🚀 Deploying: $env:TICKETDESK_IMAGE"
+          Write-Host "═══════════════════════════════════════════"
+
+          Write-Host ""
+          Write-Host "📥 Pulling image..."
+          docker compose pull next-app
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "❌ Failed to pull image!"
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "🔄 Starting services (docker compose up -d)..."
+          docker compose up -d
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "❌ Failed to start services!"
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "✅ Services started. Waiting for healthcheck..."
+
+      # ─── Шаг 6: Healthcheck ────────────────────────────────
+      - name: "❤️ Healthcheck"
+        id: healthcheck
+        shell: pwsh
+        run: |
+          $maxRetries = 12  # 12 * 5 сек = 60 секунд максимум
+          $retryInterval = 5
+          $url = "http://localhost:8080/healthz"
+          $healthy = $false
+
+          Write-Host "🏥 Checking $url (max ${maxRetries} retries, ${retryInterval}s interval)..."
+
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            Write-Host "  Attempt $i/$maxRetries..."
+            try {
+              $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
+              if ($response.StatusCode -eq 200) {
+                Write-Host "✅ Healthcheck passed! Status: $($response.StatusCode)"
+                Write-Host "  Response: $($response.Content)"
+                $healthy = $true
+                break
+              }
+            } catch {
+              Write-Host "  ⏳ Not ready yet: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds $retryInterval
+          }
+
+          if ($healthy) {
+            echo "HEALTHY=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Warning "❌ Healthcheck FAILED after $maxRetries attempts!"
+            echo "HEALTHY=false" >> $env:GITHUB_OUTPUT
+          }
+
+      # ─── Шаг 7: Сохраняем тег (если deployment успешный) ───
+      - name: "✅ Save successful deploy tag"
+        if: steps.healthcheck.outputs.HEALTHY == 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.tag.outputs.DEPLOY_TAG }}"
+          $tagFile = ".deploy/last_good_tag.txt"
+          $tag | Set-Content $tagFile -NoNewline
+          Write-Host "💾 Saved '$tag' as last good tag"
+          Write-Host ""
+          Write-Host "═══════════════════════════════════════════"
+          Write-Host "🎉 Deploy SUCCESSFUL!"
+          Write-Host "  🌐 App: http://localhost:8080"
+          Write-Host "  ❤️ Health: http://localhost:8080/healthz"
+          Write-Host "  📋 Logs: docker compose logs -f"
+          Write-Host "═══════════════════════════════════════════"
+
+      # ─── Шаг 8: Rollback (если healthcheck не прошёл) ──────
+      - name: "🔄 Rollback to previous version"
+        if: steps.healthcheck.outputs.HEALTHY == 'false'
+        shell: pwsh
+        env:
+          REGISTRY_URL: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+        run: |
+          $tagFile = ".deploy/last_good_tag.txt"
+
+          if (Test-Path $tagFile) {
+            $previousTag = (Get-Content $tagFile -Raw).Trim()
+            Write-Host "🔄 Rolling back to previous good tag: $previousTag"
+
+            $env:TICKETDESK_IMAGE = "$env:REGISTRY_URL`:$previousTag"
+            Write-Host "  Image: $env:TICKETDESK_IMAGE"
+
+            docker compose pull next-app
+            docker compose up -d
+
+            # Проверяем rollback
+            Start-Sleep -Seconds 15
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:8080/healthz" -UseBasicParsing -TimeoutSec 10
+              if ($response.StatusCode -eq 200) {
+                Write-Host "✅ Rollback successful! Running on tag: $previousTag"
+              } else {
+                Write-Error "❌ Rollback healthcheck also failed!"
+              }
+            } catch {
+              Write-Error "❌ Rollback healthcheck failed: $($_.Exception.Message)"
+            }
+          } else {
+            Write-Error "❌ No previous tag found for rollback!"
+            Write-Host "  📋 Check docker compose logs:"
+            docker compose logs --tail 50 next-app
+          }
+
+          # Всегда завершаем с ошибкой если основной healthcheck не прошёл
+          Write-Error "❌ Deploy FAILED (see above for rollback status)"
+          exit 1
+
+      # ─── Шаг 9: Показываем логи при ошибке ─────────────────
+      - name: "📋 Show logs on failure"
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "═══ nginx logs (last 30 lines) ═══"
+          docker compose logs --tail 30 nginx
+          Write-Host ""
+          Write-Host "═══ next-app logs (last 30 lines) ═══"
+          docker compose logs --tail 30 next-app

@@ -1,0 +1,31 @@
+# ===== Зависимости =====
+node_modules/
+
+# ===== Next.js build =====
+.next/
+out/
+
+# ===== Тесты =====
+coverage/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== Env =====
+.env
+.env.local
+.env.*.local
+
+# ===== Docker (локальные данные) =====
+data/
+
+# ===== Deploy state =====
+.deploy/last_good_tag.txt

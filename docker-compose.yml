@@ -1,0 +1,92 @@
+# ============================================================
+# Docker Compose — оркестрация всех сервисов Ticket Desk
+# ============================================================
+#
+# Запуск (локальная разработка, билд из исходников):
+#   docker compose up --build
+#
+# Запуск (продакшен, image из GHCR):
+#   TICKETDESK_IMAGE=ghcr.io/owner/repo:tag docker compose pull next-app
+#   TICKETDESK_IMAGE=ghcr.io/owner/repo:tag docker compose up -d
+#
+# Остановка:
+#   docker compose down
+#
+# Остановка + удаление volumes (ОСТОРОЖНО: удалит данные!):
+#   docker compose down -v
+
+services:
+  # ──────────────────────────────────────────────────────────
+  # NGINX — reverse proxy перед Next.js
+  # ──────────────────────────────────────────────────────────
+  # Зачем: gzip, кеширование статики, security headers, логи.
+  # Подробнее: docs/nginx-explained.md
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      # host:8080 → container:80
+      # Вы открываете http://localhost:8080 в браузере
+      - "8080:80"
+    volumes:
+      # Монтируем СВОЙ nginx.conf вместо дефолтного
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      next-app:
+        # Ждём, пока next-app пройдёт healthcheck, потом запускаем nginx.
+        # Без этого nginx получит 502 (upstream unavailable).
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────
+  # NEXT-APP — основное приложение (Next.js SSR)
+  # ──────────────────────────────────────────────────────────
+  next-app:
+    # Если TICKETDESK_IMAGE задан — используется он (для pull из GHCR).
+    # Иначе — локальный тег "ticketdesk:latest".
+    image: ${TICKETDESK_IMAGE:-ticketdesk:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - DATA_PATH=/data/db.json
+    volumes:
+      # Named volume для JSON-хранилища.
+      # Данные ПЕРЕЖИВАЮТ перезапуск контейнера (docker compose down/up).
+      # Удаляются ТОЛЬКО при docker compose down -v.
+      - tickets-data:/data
+    healthcheck:
+      # Проверяем /healthz каждые 10 секунд.
+      # wget --spider = HEAD-запрос (не скачивает тело).
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    # Ограничение ресурсов (опционально, для безопасности)
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  # ──────────────────────────────────────────────────────────
+  # TRAFFIC-GEN — генератор трафика для "живых" логов nginx
+  # ──────────────────────────────────────────────────────────
+  # Включается ТОЛЬКО с профилем:
+  #   docker compose --profile traffic up -d
+  traffic-gen:
+    build:
+      context: ./traffic-gen
+    depends_on:
+      nginx:
+        condition: service_started
+    profiles:
+      - traffic
+    restart: unless-stopped
+
+# Named volume — хранит JSON-файл между перезапусками
+volumes:
+  tickets-data:
+    driver: local
