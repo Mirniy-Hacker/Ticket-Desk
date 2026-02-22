@@ -290,6 +290,7 @@ docker login ghcr.io -u YOUR_USERNAME
 
 ## 📚 Дополнительная документация
 
+- [docs/github-actions-explained.md](docs/github-actions-explained.md) — **GitHub Actions + CI/CD**: workflows, jobs, steps, GHCR, ветки, пайплайны — всё с теорией и практикой
 - [docs/nginx-explained.md](docs/nginx-explained.md) — зачем nginx, gzip, cache, security
 - [docs/next-vs-react.md](docs/next-vs-react.md) — SSR, Server Actions, API routes на примерах проекта
 - [docs/docker-basics-this-project.md](docs/docker-basics-this-project.md) — Dockerfile, volumes, сети, ресурсы
